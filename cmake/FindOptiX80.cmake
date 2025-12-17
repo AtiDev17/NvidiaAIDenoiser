@@ -11,7 +11,7 @@ set(OPTIX80_PATH $ENV{OPTIX80_PATH})
 if("${OPTIX80_PATH}" STREQUAL "")
     if(WIN32)
         # Try finding it inside the default installation directory under Windows first.
-        set(OPTIX80_PATH "C:/ProgramData/NVIDIA Corporation/OptiX SDK 8.0.0")
+        set(OPTIX80_PATH "C:/ProgramData/NVIDIA Corporation/OptiX SDK 9.1.0")
     else()
         # Adjust this if the OptiX SDK 8.0.0 installation is in a different location.
         set(OPTIX80_PATH "~/NVIDIA-OptiX-SDK-8.0.0-linux64")

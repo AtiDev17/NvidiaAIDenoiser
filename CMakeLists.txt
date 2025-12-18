@@ -7,17 +7,21 @@ add_definitions(-DNOMINMAX)
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${PROJECT_SOURCE_DIR}/cmake)
 
-find_package(OptiX80)
+find_package(OptiX REQUIRED)
 # Add CUDA
 find_package(CUDAToolkit 12.0 REQUIRED)
 set(OIIO_DIR ${PROJECT_SOURCE_DIR}/contrib/OpenImageIO)
 find_package(OpenImageIO REQUIRED)
 
 # Include directories
-include_directories(${OPTIX80_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS} ${OIIO_INCLUDE_DIR})
+include_directories(${OPTIX_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS} ${OIIO_INCLUDE_DIR})
 
 # Source files
-set(SOURCES src/main.cpp)
+set(SOURCES 
+    src/main.cpp
+    src/CudaCheck.h
+    src/CudaBuffer.h
+)
 
 # Executable
 add_executable(${PROJECT_NAME} ${SOURCES})

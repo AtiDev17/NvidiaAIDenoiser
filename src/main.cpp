@@ -119,6 +119,17 @@ private:
 
     int m_width = 0;
     int m_height = 0;
+
+    // Tiling config
+    unsigned int m_tile_width = 2048; // Max tile width (excluding overlap)
+    unsigned int m_tile_height = 2048; // Max tile height (excluding overlap)
+    unsigned int m_overlap = 64;       // Overlap size
+
+    // Tile buffers (reused)
+    std::vector<CudaBuffer> m_tile_layer_buffers;
+    CudaBuffer m_tile_albedo_buffer;
+    CudaBuffer m_tile_normal_buffer;
+    CudaBuffer m_tile_flow_buffer;
 };
 
 std::string DenoiserApp::getTime()
@@ -314,12 +325,25 @@ void DenoiserApp::setupDenoiser()
 
     OPTIX_CHECK(optixDenoiserCreate(m_optix_context, model, &options, &m_optix_denoiser));
 
-    OPTIX_CHECK(optixDenoiserComputeMemoryResources(m_optix_denoiser, m_width, m_height, &m_denoiser_sizes));
+    // Determine if tiling is needed and get overlap
+    OPTIX_CHECK(optixDenoiserComputeMemoryResources(m_optix_denoiser, 512, 512, &m_denoiser_sizes));
+    m_overlap = m_denoiser_sizes.overlapWindowSizeInPixels;
+
+    unsigned int compute_width = m_width;
+    unsigned int compute_height = m_height;
+
+    if (m_width > 4096 || m_height > 4096) {
+        logInfo("Image too large for single pass, using tiling (%dx%d tiles with %d overlap)", m_tile_width, m_tile_height, m_overlap);
+        compute_width = std::min((unsigned int)m_width, m_tile_width + 2 * m_overlap);
+        compute_height = std::min((unsigned int)m_height, m_tile_height + 2 * m_overlap);
+    }
+
+    OPTIX_CHECK(optixDenoiserComputeMemoryResources(m_optix_denoiser, compute_width, compute_height, &m_denoiser_sizes));
 
     m_denoiser_state.alloc(m_denoiser_sizes.stateSizeInBytes);
     m_denoiser_scratch.alloc(m_denoiser_sizes.withoutOverlapScratchSizeInBytes);
 
-    OPTIX_CHECK(optixDenoiserSetup(m_optix_denoiser, m_cuda_stream, m_width, m_height, 
+    OPTIX_CHECK(optixDenoiserSetup(m_optix_denoiser, m_cuda_stream, compute_width, compute_height, 
         m_denoiser_state.d_ptr(), m_denoiser_sizes.stateSizeInBytes,
         m_denoiser_scratch.d_ptr(), m_denoiser_sizes.withoutOverlapScratchSizeInBytes));
 
@@ -447,12 +471,12 @@ void DenoiserApp::executeDenoiser()
     
     // Upload Beauty
     convertToFloat4(m_beauty.data.get(), scratch, m_width, m_height);
-    CU_CHECK(cudaMemcpy((void*)m_layers[0].input.data, scratch.data(), scratch.size() * sizeof(float), cudaMemcpyHostToDevice));
+    m_layer_buffers[0].copyToDevice(scratch.data(), scratch.size() * sizeof(float));
 
     // Upload Previous
     if (m_pi_loaded) {
         convertToFloat4(m_prev_denoised.data.get(), scratch, m_width, m_height);
-        CU_CHECK(cudaMemcpy((void*)m_layers[0].previousOutput.data, scratch.data(), scratch.size() * sizeof(float), cudaMemcpyHostToDevice));
+        m_layer_buffers[m_layers.size() * 2].copyToDevice(scratch.data(), scratch.size() * sizeof(float));
     }
 
     // Guides
@@ -473,24 +497,102 @@ void DenoiserApp::executeDenoiser()
     int aov_idx = 1;
     for(auto& pair : m_aovs) {
         convertToFloat4(pair.second.data.get(), scratch, m_width, m_height);
-        CU_CHECK(cudaMemcpy((void*)m_layers[aov_idx].input.data, scratch.data(), scratch.size() * sizeof(float), cudaMemcpyHostToDevice));
+        m_layer_buffers[aov_idx * 2].copyToDevice(scratch.data(), scratch.size() * sizeof(float));
         aov_idx++;
     }
 
+    // Compute Intensity on full image
+    logInfo("Computing HDR intensity...");
+    size_t intensity_scratch_size = sizeof(int) * (2 + (size_t)m_width * m_height);
+    CudaBuffer intensity_scratch;
+    intensity_scratch.alloc(intensity_scratch_size);
+    OPTIX_CHECK(optixDenoiserComputeIntensity(m_optix_denoiser, m_cuda_stream, &m_layers[0].input, m_denoiser_params.hdrIntensity,
+        intensity_scratch.d_ptr(), intensity_scratch.size()));
+
     // Execute
+    bool use_tiling = (m_width > 4096 || m_height > 4096);
     long long total_time = 0;
-    for (unsigned int i = 0; i < m_num_runs; i++)
+
+    for (unsigned int run = 0; run < m_num_runs; run++)
     {
-        logInfo("Denoising...");
         auto start = std::chrono::high_resolution_clock::now();
 
-        OPTIX_CHECK(optixDenoiserComputeIntensity(m_optix_denoiser, m_cuda_stream, &m_layers[0].input, m_denoiser_params.hdrIntensity,
-            m_denoiser_scratch.d_ptr(), m_denoiser_sizes.withoutOverlapScratchSizeInBytes));
+        if (!use_tiling)
+        {
+            logInfo("Denoising (single pass)...");
+            OPTIX_CHECK(optixDenoiserInvoke(m_optix_denoiser, m_cuda_stream, &m_denoiser_params,
+                m_denoiser_state.d_ptr(), m_denoiser_sizes.stateSizeInBytes,
+                &m_guide_layer, m_layers.data(), (unsigned int)m_layers.size(), 0, 0,
+                m_denoiser_scratch.d_ptr(), m_denoiser_sizes.withoutOverlapScratchSizeInBytes));
+        }
+        else
+        {
+            logInfo("Denoising (tiled)...");
+            for (unsigned int ty = 0; ty < (unsigned int)m_height; ty += m_tile_height)
+            {
+                for (unsigned int tx = 0; tx < (unsigned int)m_width; tx += m_tile_width)
+                {
+                    // Valid region for this tile
+                    unsigned int tw = std::min(m_tile_width, (unsigned int)m_width - tx);
+                    unsigned int th = std::min(m_tile_height, (unsigned int)m_height - ty);
 
-        OPTIX_CHECK(optixDenoiserInvoke(m_optix_denoiser, m_cuda_stream, &m_denoiser_params,
-            m_denoiser_state.d_ptr(), m_denoiser_sizes.stateSizeInBytes,
-            &m_guide_layer, m_layers.data(), (unsigned int)m_layers.size(), 0, 0,
-            m_denoiser_scratch.d_ptr(), m_denoiser_sizes.withoutOverlapScratchSizeInBytes));
+                    // Input region with overlap
+                    int x0 = std::max(0, (int)tx - (int)m_overlap);
+                    int y0 = std::max(0, (int)ty - (int)m_overlap);
+                    int x1 = std::min(m_width, (int)(tx + tw + m_overlap));
+                    int y1 = std::min(m_height, (int)(ty + th + m_overlap));
+
+                    unsigned int sub_w = x1 - x0;
+                    unsigned int sub_h = y1 - y0;
+
+                    // Offset of the valid region within the input tile
+                    unsigned int inputOffsetX = tx - x0;
+                    unsigned int inputOffsetY = ty - y0;
+
+                    // Set up tile-specific layers and guide
+                    OptixDenoiserGuideLayer tile_guide = m_guide_layer;
+                    std::vector<OptixDenoiserLayer> tile_layers = m_layers;
+
+                    // Helper to map input images (includes overlap)
+                    auto set_input_tile = [&](OptixImage2D& img, CUdeviceptr base_ptr, int pixel_stride) {
+                        img.data = base_ptr + (size_t)(y0 * m_width + x0) * pixel_stride;
+                        img.width = sub_w;
+                        img.height = sub_h;
+                        img.rowStrideInBytes = m_width * pixel_stride;
+                    };
+
+                    // Helper to map output images (valid region only)
+                    auto set_output_tile = [&](OptixImage2D& img, CUdeviceptr base_ptr, int pixel_stride) {
+                        img.data = base_ptr + (size_t)(ty * m_width + tx) * pixel_stride;
+                        img.width = tw;
+                        img.height = th;
+                        img.rowStrideInBytes = m_width * pixel_stride;
+                    };
+
+                    if (m_a_loaded) set_input_tile(tile_guide.albedo, m_albedo_buffer.d_ptr(), sizeof(float) * 4);
+                    if (m_n_loaded) set_input_tile(tile_guide.normal, m_normal_buffer.d_ptr(), sizeof(float) * 4);
+                    if (m_mv_loaded) set_input_tile(tile_guide.flow, m_flow_buffer.d_ptr(), sizeof(float) * 2);
+
+                    for (size_t i = 0; i < tile_layers.size(); ++i)
+                    {
+                        // Input reads from overlapped region
+                        set_input_tile(tile_layers[i].input, m_layer_buffers[i * 2].d_ptr(), sizeof(float) * 4);
+                        
+                        // Output writes to valid region only
+                        set_output_tile(tile_layers[i].output, m_layer_buffers[i * 2 + 1].d_ptr(), sizeof(float) * 4);
+                        
+                        if (i == 0 && m_pi_loaded)
+                            set_input_tile(tile_layers[i].previousOutput, m_layer_buffers[tile_layers.size() * 2].d_ptr(), sizeof(float) * 4);
+                    }
+
+                    OPTIX_CHECK(optixDenoiserInvoke(m_optix_denoiser, m_cuda_stream, &m_denoiser_params,
+                        m_denoiser_state.d_ptr(), m_denoiser_sizes.stateSizeInBytes,
+                        &tile_guide, tile_layers.data(), (unsigned int)tile_layers.size(), 
+                        inputOffsetX, inputOffsetY,
+                        m_denoiser_scratch.d_ptr(), m_denoiser_sizes.withoutOverlapScratchSizeInBytes));
+                }
+            }
+        }
         
         CU_CHECK(cudaStreamSynchronize(m_cuda_stream)); // Wait for completion
 
@@ -498,7 +600,7 @@ void DenoiserApp::executeDenoiser()
         long long msec = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
         total_time += msec;
         
-        if (m_num_runs > 1) logInfo("Run %d: %lld ms", i, msec);
+        if (m_num_runs > 1) logInfo("Run %d: %lld ms", run, msec);
         else logInfo("Complete in %lld ms", msec);
     }
     if (m_num_runs > 1) logInfo("Average: %lld ms", total_time / m_num_runs);

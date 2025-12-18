@@ -58,27 +58,7 @@ make
 
 ## Distribution
 
-To package the application for distribution, you need to collect the executable and all required DLLs.
-
-#### Windows (PowerShell)
-
-After building the project in Release mode:
-
-```powershell
-# Create distribution directory
-mkdir dist/bin
-
-# Install the executable and assets (README, LICENSE)
-cd build
-cmake --install . --config Release --prefix "../dist"
-
-# Copy required DLLs from vcpkg
-# (Adjust the vcpkg path if necessary)
-Copy-Item "../vcpkg_installed/x64-windows/bin/*.dll" -Destination "../dist/bin"
-```
-
-The `dist/bin` folder now contains the standalone application ready to be zipped and shared.
-
+To package the application for distribution, you can modify and run the create_dist.bat_
 ## Usage
 Command line parameters
 * -i [string] : path to input image

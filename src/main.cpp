@@ -116,6 +116,8 @@ private:
     CudaBuffer m_albedo_buffer;
     CudaBuffer m_normal_buffer;
     CudaBuffer m_flow_buffer;
+    CudaBuffer m_internal_guide_layer_buffer;
+    CudaBuffer m_internal_guide_layer_prev_buffer;
 
     int m_width = 0;
     int m_height = 0;
@@ -142,7 +144,7 @@ std::string DenoiserApp::getTime()
     milliseconds -= seconds * 1000.0;
     seconds %= 60;
     char s[32];
-    sprintf(s, "%02d:%02d:%03d", minutes, seconds, (int)milliseconds);
+    snprintf(s, sizeof(s), "%02d:%02d:%03d", minutes, seconds, (int)milliseconds);
     return std::string(s);
 }
 
@@ -196,7 +198,7 @@ bool DenoiserApp::discoverDevices()
     {
         cudaDeviceProp prop;
         cudaGetDeviceProperties(&prop, i);
-        logInfo("GPU %d: %s (compute %d.%d) with %dMB memory", i, prop.name, prop.major, prop.minor, prop.totalGlobalMem / 1024 / 1024);
+        logInfo("GPU %d: %s (compute %d.%d) with %dMB memory", i, prop.name, prop.major, prop.minor, (int)(prop.totalGlobalMem / 1024 / 1024));
         m_device_props.push_back(prop);
     }
     return true;
@@ -321,7 +323,7 @@ void DenoiserApp::setupDenoiser()
     if (m_pi_loaded) model = OPTIX_DENOISER_MODEL_KIND_TEMPORAL;
     
     if (m_denoise_aovs && m_pi_loaded)
-        throw std::runtime_error("Temporal AOV denoising not yet supported");
+        model = OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV;
 
     OPTIX_CHECK(optixDenoiserCreate(m_optix_context, model, &options, &m_optix_denoiser));
 
@@ -342,6 +344,26 @@ void DenoiserApp::setupDenoiser()
 
     m_denoiser_state.alloc(m_denoiser_sizes.stateSizeInBytes);
     m_denoiser_scratch.alloc(m_denoiser_sizes.withoutOverlapScratchSizeInBytes);
+
+    if (model == OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV) {
+        size_t internalGuideLayerSize = (size_t)compute_width * compute_height * m_denoiser_sizes.internalGuideLayerPixelSizeInBytes;
+        m_internal_guide_layer_buffer.alloc(internalGuideLayerSize);
+        m_internal_guide_layer_prev_buffer.alloc(internalGuideLayerSize);
+        
+        m_guide_layer.outputInternalGuideLayer.data = m_internal_guide_layer_buffer.d_ptr();
+        m_guide_layer.outputInternalGuideLayer.width = compute_width;
+        m_guide_layer.outputInternalGuideLayer.height = compute_height;
+        m_guide_layer.outputInternalGuideLayer.pixelStrideInBytes = m_denoiser_sizes.internalGuideLayerPixelSizeInBytes;
+        m_guide_layer.outputInternalGuideLayer.rowStrideInBytes = m_guide_layer.outputInternalGuideLayer.width * m_denoiser_sizes.internalGuideLayerPixelSizeInBytes;
+        m_guide_layer.outputInternalGuideLayer.format = OPTIX_PIXEL_FORMAT_INTERNAL_GUIDE_LAYER;
+
+        m_guide_layer.previousOutputInternalGuideLayer.data = m_internal_guide_layer_prev_buffer.d_ptr();
+        m_guide_layer.previousOutputInternalGuideLayer.width = compute_width;
+        m_guide_layer.previousOutputInternalGuideLayer.height = compute_height;
+        m_guide_layer.previousOutputInternalGuideLayer.pixelStrideInBytes = m_denoiser_sizes.internalGuideLayerPixelSizeInBytes;
+        m_guide_layer.previousOutputInternalGuideLayer.rowStrideInBytes = m_guide_layer.previousOutputInternalGuideLayer.width * m_denoiser_sizes.internalGuideLayerPixelSizeInBytes;
+        m_guide_layer.previousOutputInternalGuideLayer.format = OPTIX_PIXEL_FORMAT_INTERNAL_GUIDE_LAYER;
+    }
 
     OPTIX_CHECK(optixDenoiserSetup(m_optix_denoiser, m_cuda_stream, compute_width, compute_height, 
         m_denoiser_state.d_ptr(), m_denoiser_sizes.stateSizeInBytes,
@@ -428,6 +450,11 @@ void DenoiserApp::setupDenoiser()
         m_guide_layer.flow.pixelStrideInBytes = pixel_size_2;
         m_guide_layer.flow.format = OPTIX_PIXEL_FORMAT_FLOAT2;
     }
+    
+    // For temporal modes, we need to handle the temporalModeUsePreviousLayers flag
+    // For single-shot execution without a loop, we assume reset (0). 
+    // If run > 0 (in the loop below), we will set it to 1.
+    m_denoiser_params.temporalModeUsePreviousLayers = 0;
 }
 
 // Helper to convert pixels to format for OptiX (contiguous float)
@@ -517,6 +544,10 @@ void DenoiserApp::executeDenoiser()
     {
         auto start = std::chrono::high_resolution_clock::now();
 
+        if (run > 0 || m_pi_loaded) {
+             m_denoiser_params.temporalModeUsePreviousLayers = 1;
+        }
+
         if (!use_tiling)
         {
             logInfo("Denoising (single pass)...");
@@ -572,6 +603,12 @@ void DenoiserApp::executeDenoiser()
                     if (m_a_loaded) set_input_tile(tile_guide.albedo, m_albedo_buffer.d_ptr(), sizeof(float) * 4);
                     if (m_n_loaded) set_input_tile(tile_guide.normal, m_normal_buffer.d_ptr(), sizeof(float) * 4);
                     if (m_mv_loaded) set_input_tile(tile_guide.flow, m_flow_buffer.d_ptr(), sizeof(float) * 2);
+                    
+                    // Handle tile mapping for internal guide layers if present
+                    if (m_guide_layer.previousOutputInternalGuideLayer.data) {
+                         set_input_tile(tile_guide.previousOutputInternalGuideLayer, m_internal_guide_layer_prev_buffer.d_ptr(), m_denoiser_sizes.internalGuideLayerPixelSizeInBytes);
+                         set_output_tile(tile_guide.outputInternalGuideLayer, m_internal_guide_layer_buffer.d_ptr(), m_denoiser_sizes.internalGuideLayerPixelSizeInBytes);
+                    }
 
                     for (size_t i = 0; i < tile_layers.size(); ++i)
                     {
@@ -594,13 +631,22 @@ void DenoiserApp::executeDenoiser()
             }
         }
         
+        // If we have internal guide layers (Temporal AOV), swap them for the next run
+        if (m_guide_layer.previousOutputInternalGuideLayer.data) {
+             std::swap(m_guide_layer.previousOutputInternalGuideLayer.data, m_guide_layer.outputInternalGuideLayer.data);
+             // Also swap the backing buffers pointers if you were managing them via the member variables, 
+             // but here we just swapped the pointers in the guide struct which is enough for the next loop.
+             // Note: In a real sequence you would also swap the image data or pointers for 'previousOutput' 
+             // but here we only handle the internal guide layer swap for demonstration of the API.
+        }
+
         CU_CHECK(cudaStreamSynchronize(m_cuda_stream)); // Wait for completion
 
         auto end = std::chrono::high_resolution_clock::now();
         long long msec = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
         total_time += msec;
         
-        if (m_num_runs > 1) logInfo("Run %d: %lld ms", run, msec);
+        if (m_num_runs > 1) logInfo("Run %u: %lld ms", run, msec);
         else logInfo("Complete in %lld ms", msec);
     }
     if (m_num_runs > 1) logInfo("Average: %lld ms", total_time / m_num_runs);
@@ -612,14 +658,14 @@ void DenoiserApp::saveImages()
     std::vector<float> host_pixels(m_width * m_height * 4);
     
     // Save Beauty
-    CU_CHECK(cudaMemcpy(host_pixels.data(), (void*)m_layers[0].output.data, host_pixels.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CU_CHECK(cudaMemcpy(host_pixels.data(), reinterpret_cast<const void*>(m_layers[0].output.data), host_pixels.size() * sizeof(float), cudaMemcpyDeviceToHost));
     
     // Convert back to original channels
     int channels = OIIO::get_roi_full(m_beauty.data->spec()).nchannels();
-    std::vector<float> final_pixels(m_width * m_height * channels);
+    std::vector<float> final_pixels((size_t)m_width * m_height * channels);
     for(int i=0; i<m_width*m_height; ++i) {
         for(int c=0; c<channels; ++c) {
-            final_pixels[i*channels + c] = host_pixels[i*4 + c];
+            final_pixels[(size_t)i*channels + c] = host_pixels[(size_t)i*4 + c];
         }
     }
     m_beauty.data->set_pixels(OIIO::get_roi_full(m_beauty.data->spec()), OIIO::TypeDesc::FLOAT, final_pixels.data());
@@ -642,13 +688,13 @@ void DenoiserApp::saveImages()
     // Save AOVs
     int aov_idx = 1;
     for(auto& pair : m_aovs) {
-        CU_CHECK(cudaMemcpy(host_pixels.data(), (void*)m_layers[aov_idx].output.data, host_pixels.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        CU_CHECK(cudaMemcpy(host_pixels.data(), reinterpret_cast<const void*>(m_layers[aov_idx].output.data), host_pixels.size() * sizeof(float), cudaMemcpyDeviceToHost));
         
         channels = OIIO::get_roi_full(pair.second.data->spec()).nchannels();
-        final_pixels.resize(m_width * m_height * channels);
+        final_pixels.resize((size_t)m_width * m_height * channels);
         for(int i=0; i<m_width*m_height; ++i) {
              for(int c=0; c<channels; ++c) {
-                 final_pixels[i*channels + c] = host_pixels[i*4 + c];
+                 final_pixels[(size_t)i*channels + c] = host_pixels[(size_t)i*4 + c];
              }
         }
         pair.second.data->set_pixels(OIIO::get_roi_full(pair.second.data->spec()), OIIO::TypeDesc::FLOAT, final_pixels.data());

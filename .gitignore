@@ -1,4 +1,7 @@
 .vs
+vcpkg_installed
+out
+dist
 # C++ objects and libs
 
 *.slo

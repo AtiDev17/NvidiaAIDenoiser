@@ -335,8 +335,8 @@ void DenoiserApp::setupDenoiser()
 
     // Allocate GPU buffers for layers
     // Each layer needs input and output, and potentially previousOutput
-    size_t pixel_size_4 = sizeof(float) * 4;
-    size_t img_size_bytes_4 = m_width * m_height * pixel_size_4;
+    unsigned int pixel_size_4 = sizeof(float) * 4;
+    size_t img_size_bytes_4 = (size_t)m_width * m_height * pixel_size_4;
 
     for (auto& layer : m_layers)
     {
@@ -395,8 +395,8 @@ void DenoiserApp::setupDenoiser()
         m_guide_layer.normal.format = OPTIX_PIXEL_FORMAT_FLOAT4;
     }
     if (m_mv_loaded) {
-        size_t pixel_size_2 = sizeof(float) * 2;
-        m_flow_buffer.alloc(m_width * m_height * pixel_size_2);
+        unsigned int pixel_size_2 = sizeof(float) * 2;
+        m_flow_buffer.alloc((size_t)m_width * m_height * pixel_size_2);
         m_guide_layer.flow.data = m_flow_buffer.d_ptr();
         m_guide_layer.flow.width = m_width;
         m_guide_layer.flow.height = m_height;

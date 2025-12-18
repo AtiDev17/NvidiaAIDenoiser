@@ -1,17 +1,83 @@
 # NVidia AI Denoiser command line tool
 
-This is a simple implementation of NVidia AI denoiser. You can find a pre-built windows distribution either on my website [here](https://declanrussell.com/portfolio/nvidia-ai-denoiser/) or in the releases tab of this repro. To build you will need to install the CUDA took availible from [here](https://developer.nvidia.com/cuda-downloads) and the OptiX 7/8 SDK availible [here](https://developer.nvidia.com/designworks/optix/download).
+This is a simple implementation of NVidia AI denoiser. You can find a pre-built windows distribution either on my website [here](https://declanrussell.com/portfolio/nvidia-ai-denoiser/) or in the releases tab of this repro.
 
 **You will require an Nvidia driver of at least 465.84 or higher and an Nvidia GPU of Maxwell architecture or newer to use the OptiX denoiser.**
 
-## Building on Ubuntu/Debian
-You need to set the `OPTIX80_PATH` environment variable, which is your OptiX SDK Path(eg /home/rabbit/NVIDIA-OptiX-SDK-8.0.0-linux64-x86_64).
+## Prerequisites
+
+To build this project, you will need the following tools and SDKs:
+
+*   **CMake** (3.10 or higher)
+*   **C++ Compiler** (MSVC on Windows, GCC/Clang on Linux)
+*   **NVIDIA CUDA Toolkit** (12.0 or higher) - [Download](https://developer.nvidia.com/cuda-downloads)
+*   **NVIDIA OptiX SDK** (8.0 or higher) - [Download](https://developer.nvidia.com/designworks/optix/download)
+    *   *Note:* Set the `OPTIX_PATH` environment variable to your OptiX SDK installation directory if CMake cannot find it automatically.
+*   **vcpkg** - C++ Package Manager for managing dependencies (specifically OpenImageIO).
+
+## Building
+
+This project uses CMake and vcpkg for building.
+
+### 1. Install vcpkg
+
+If you haven't installed vcpkg yet, clone it and bootstrap it:
+
+```bash
+git clone https://github.com/microsoft/vcpkg.git
+cd vcpkg
+# On Windows:
+.\bootstrap-vcpkg.bat
+# On Linux:
+./bootstrap-vcpkg.sh
 ```
-sudo apt install -y openimageio-tools
-mkdir build && cd build
-cmake ..
+
+### 2. Configure and Build
+
+Navigate to the `NvidiaAIDenoiser` directory and run CMake, pointing to your vcpkg installation's toolchain file.
+
+#### Windows (PowerShell)
+
+```powershell
+mkdir build
+cd build
+cmake .. "-DCMAKE_TOOLCHAIN_FILE=[path/to/vcpkg]/scripts/buildsystems/vcpkg.cmake"
+cmake --build . --config Release
+```
+
+*Replace `[path/to/vcpkg]` with the actual path where you installed vcpkg.*
+
+#### Linux
+
+```bash
+mkdir build
+cd build
+cmake .. -DCMAKE_TOOLCHAIN_FILE=[path/to/vcpkg]/scripts/buildsystems/vcpkg.cmake
 make
 ```
+
+## Distribution
+
+To package the application for distribution, you need to collect the executable and all required DLLs.
+
+#### Windows (PowerShell)
+
+After building the project in Release mode:
+
+```powershell
+# Create distribution directory
+mkdir dist/bin
+
+# Install the executable and assets (README, LICENSE)
+cd build
+cmake --install . --config Release --prefix "../dist"
+
+# Copy required DLLs from vcpkg
+# (Adjust the vcpkg path if necessary)
+Copy-Item "../vcpkg_installed/x64-windows/bin/*.dll" -Destination "../dist/bin"
+```
+
+The `dist/bin` folder now contains the standalone application ready to be zipped and shared.
 
 ## Usage
 Command line parameters

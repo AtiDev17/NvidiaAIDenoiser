@@ -18,11 +18,6 @@
 #include <unordered_map>
 #include <memory>
 
-#ifdef _WIN32
-#include <windows.h>
-#include <winternl.h>
-#endif
-
 #include "CudaCheck.h"
 #include "CudaBuffer.h"
 
@@ -47,7 +42,9 @@ public:
 
     ~DenoiserApp()
     {
-        cleanup();
+        if (m_optix_denoiser) optixDenoiserDestroy(m_optix_denoiser);
+        if (m_optix_context) optixDeviceContextDestroy(m_optix_context);
+        if (m_cuda_stream) cudaStreamDestroy(m_cuda_stream);
     }
 
     void run(int argc, char *argv[]);
@@ -66,7 +63,7 @@ private:
     void setupDenoiser();
     void executeDenoiser();
     void saveImages();
-    void cleanup();
+    void uploadLayer(const ImageInfo& img, CudaBuffer& buffer, int target_channels);
 
     // Helper to format string
     std::string format(const char* fmt, ...);
@@ -304,7 +301,6 @@ void DenoiserApp::setupDenoiser()
     m_height = roi.height();
 
     CU_CHECK(cudaSetDevice(m_selected_device_id));
-    CU_CHECK(cudaFree(0)); // Init context
     CU_CHECK(cudaStreamCreate(&m_cuda_stream));
 
     // OptiX Init
@@ -451,80 +447,53 @@ void DenoiserApp::setupDenoiser()
         m_guide_layer.flow.format = OPTIX_PIXEL_FORMAT_FLOAT2;
     }
     
-    // For temporal modes, we need to handle the temporalModeUsePreviousLayers flag
-    // For single-shot execution without a loop, we assume reset (0). 
-    // If run > 0 (in the loop below), we will set it to 1.
     m_denoiser_params.temporalModeUsePreviousLayers = 0;
 }
 
-// Helper to convert pixels to format for OptiX (contiguous float)
-void convertToFloat4(const OIIO::ImageBuf* img, std::vector<float>& dest, int width, int height)
+// Helper to convert pixels to format for OptiX using OIIO stride
+// Optimized: Avoids manual loop by using get_pixels with stride
+void DenoiserApp::uploadLayer(const ImageInfo& img, CudaBuffer& buffer, int target_channels)
 {
-    OIIO::ROI roi = OIIO::get_roi_full(img->spec());
-    std::vector<float> raw_pixels(width * height * roi.nchannels());
-    img->get_pixels(roi, OIIO::TypeDesc::FLOAT, &raw_pixels[0]);
+    // Ensure we only read up to the configured resolution
+    OIIO::ROI roi(0, m_width, 0, m_height, 0, 1, 0, img.data->nchannels());
     
-    dest.resize(width * height * 4);
-    int channels = roi.nchannels();
+    std::vector<float> scratch;
+    scratch.resize((size_t)m_width * m_height * target_channels);
     
-    for(int i=0; i<width*height; ++i) {
-        for(int c=0; c<4; ++c) {
-            if (c < channels) dest[i*4 + c] = raw_pixels[i*channels + c];
-            else dest[i*4 + c] = 0.0f; // Fill alpha/extra with 0
-        }
-    }
-}
+    // Fill with 0
+    std::fill(scratch.begin(), scratch.end(), 0.0f);
+    
+    // Read directly into scratch with stride
+    // xstride: bytes to next pixel
+    // ystride: bytes to next row
+    OIIO::stride_t xstride = target_channels * sizeof(float);
+    OIIO::stride_t ystride = (OIIO::stride_t)m_width * xstride;
 
-void convertToFloat2(const OIIO::ImageBuf* img, std::vector<float>& dest, int width, int height)
-{
-    OIIO::ROI roi = OIIO::get_roi_full(img->spec());
-    std::vector<float> raw_pixels(width * height * roi.nchannels());
-    img->get_pixels(roi, OIIO::TypeDesc::FLOAT, &raw_pixels[0]);
-
-    dest.resize(width * height * 2);
-    int channels = roi.nchannels();
-
-    for(int i=0; i<width*height; ++i) {
-        for(int c=0; c<2; ++c) {
-            if (c < channels) dest[i*2 + c] = raw_pixels[i*channels + c];
-            else dest[i*2 + c] = 0.0f;
-        }
-    }
+    img.data->get_pixels(roi, OIIO::TypeDesc::FLOAT, scratch.data(), xstride, ystride);
+    
+    buffer.copyToDevice(scratch.data(), scratch.size() * sizeof(float));
 }
 
 void DenoiserApp::executeDenoiser()
 {
-    std::vector<float> scratch;
-    
     // Upload Beauty
-    convertToFloat4(m_beauty.data.get(), scratch, m_width, m_height);
-    m_layer_buffers[0].copyToDevice(scratch.data(), scratch.size() * sizeof(float));
+    uploadLayer(m_beauty, m_layer_buffers[0], 4);
 
     // Upload Previous
     if (m_pi_loaded) {
-        convertToFloat4(m_prev_denoised.data.get(), scratch, m_width, m_height);
-        m_layer_buffers[m_layers.size() * 2].copyToDevice(scratch.data(), scratch.size() * sizeof(float));
+        // The previous output buffer is the last one in the list
+        uploadLayer(m_prev_denoised, m_layer_buffers[m_layer_buffers.size() - 1], 4);
     }
 
     // Guides
-    if (m_a_loaded) {
-        convertToFloat4(m_albedo.data.get(), scratch, m_width, m_height);
-        m_albedo_buffer.copyToDevice(scratch.data(), scratch.size() * sizeof(float));
-    }
-    if (m_n_loaded) {
-        convertToFloat4(m_normal.data.get(), scratch, m_width, m_height);
-        m_normal_buffer.copyToDevice(scratch.data(), scratch.size() * sizeof(float));
-    }
-    if (m_mv_loaded) {
-        convertToFloat2(m_motion_vectors.data.get(), scratch, m_width, m_height);
-        m_flow_buffer.copyToDevice(scratch.data(), scratch.size() * sizeof(float));
-    }
+    if (m_a_loaded) uploadLayer(m_albedo, m_albedo_buffer, 4);
+    if (m_n_loaded) uploadLayer(m_normal, m_normal_buffer, 4);
+    if (m_mv_loaded) uploadLayer(m_motion_vectors, m_flow_buffer, 2);
 
     // AOVs
     int aov_idx = 1;
     for(auto& pair : m_aovs) {
-        convertToFloat4(pair.second.data.get(), scratch, m_width, m_height);
-        m_layer_buffers[aov_idx * 2].copyToDevice(scratch.data(), scratch.size() * sizeof(float));
+        uploadLayer(pair.second, m_layer_buffers[aov_idx * 2], 4);
         aov_idx++;
     }
 
@@ -634,10 +603,6 @@ void DenoiserApp::executeDenoiser()
         // If we have internal guide layers (Temporal AOV), swap them for the next run
         if (m_guide_layer.previousOutputInternalGuideLayer.data) {
              std::swap(m_guide_layer.previousOutputInternalGuideLayer.data, m_guide_layer.outputInternalGuideLayer.data);
-             // Also swap the backing buffers pointers if you were managing them via the member variables, 
-             // but here we just swapped the pointers in the guide struct which is enough for the next loop.
-             // Note: In a real sequence you would also swap the image data or pointers for 'previousOutput' 
-             // but here we only handle the internal guide layer swap for demonstration of the API.
         }
 
         CU_CHECK(cudaStreamSynchronize(m_cuda_stream)); // Wait for completion
@@ -711,17 +676,6 @@ void DenoiserApp::saveImages()
         }
         aov_idx++;
     }
-}
-
-void DenoiserApp::cleanup()
-{
-    if (m_optix_denoiser) optixDenoiserDestroy(m_optix_denoiser);
-    if (m_optix_context) optixDeviceContextDestroy(m_optix_context);
-    if (m_cuda_stream) cudaStreamDestroy(m_cuda_stream);
-    
-    m_optix_denoiser = nullptr;
-    m_optix_context = nullptr;
-    m_cuda_stream = nullptr;
 }
 
 void DenoiserApp::run(int argc, char *argv[])

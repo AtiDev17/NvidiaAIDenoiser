@@ -330,7 +330,7 @@ void DenoiserApp::setupDenoiser()
     unsigned int compute_width = m_width;
     unsigned int compute_height = m_height;
 
-    if (m_width > 4096 || m_height > 4096) {
+    if (m_width > m_tile_width || m_height > m_tile_height) {
         logInfo("Image too large for single pass, using tiling (%dx%d tiles with %d overlap)", m_tile_width, m_tile_height, m_overlap);
         compute_width = std::min((unsigned int)m_width, m_tile_width + 2 * m_overlap);
         compute_height = std::min((unsigned int)m_height, m_tile_height + 2 * m_overlap);
@@ -506,7 +506,7 @@ void DenoiserApp::executeDenoiser()
         intensity_scratch.d_ptr(), intensity_scratch.size()));
 
     // Execute
-    bool use_tiling = (m_width > 4096 || m_height > 4096);
+    bool use_tiling = (m_width > m_tile_width || m_height > m_tile_height);
     long long total_time = 0;
 
     for (unsigned int run = 0; run < m_num_runs; run++)
@@ -627,6 +627,8 @@ void DenoiserApp::saveImages()
     
     // Convert back to original channels
     int channels = OIIO::get_roi_full(m_beauty.data->spec()).nchannels();
+    OIIO::TypeDesc original_format = m_beauty.data->spec().format;
+
     std::vector<float> final_pixels((size_t)m_width * m_height * channels);
     for(int i=0; i<m_width*m_height; ++i) {
         for(int c=0; c<channels; ++c) {
@@ -647,7 +649,7 @@ void DenoiserApp::saveImages()
             return;
         }
     }
-    m_beauty.data->write(out_path);
+    m_beauty.data->write(out_path, original_format);
     logInfo("Saved: %s", out_path.c_str());
 
     // Save AOVs
@@ -656,6 +658,8 @@ void DenoiserApp::saveImages()
         CU_CHECK(cudaMemcpy(host_pixels.data(), reinterpret_cast<const void*>(m_layers[aov_idx].output.data), host_pixels.size() * sizeof(float), cudaMemcpyDeviceToHost));
         
         channels = OIIO::get_roi_full(pair.second.data->spec()).nchannels();
+        OIIO::TypeDesc aov_fmt = pair.second.data->spec().format;
+        
         final_pixels.resize((size_t)m_width * m_height * channels);
         for(int i=0; i<m_width*m_height; ++i) {
              for(int c=0; c<channels; ++c) {
@@ -671,7 +675,7 @@ void DenoiserApp::saveImages()
              aov_out = base + m_out_suffix + ext;
         }
         if (!aov_out.empty()) {
-            pair.second.data->write(aov_out);
+            pair.second.data->write(aov_out, aov_fmt);
             logInfo("Saved AOV %d: %s", pair.first, aov_out.c_str());
         }
         aov_idx++;

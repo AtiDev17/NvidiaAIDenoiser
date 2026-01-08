@@ -1,8 +1,11 @@
 {
   "name": "nvidia-ai-denoiser",
   "version-string": "3.1.0",
-  "builtin-baseline": "d2452281016c6d77b6ef199d599d9929eafe4807",
+  "builtin-baseline": "a48bbf436be0867d0eadc42077f280f3123e3698",
   "dependencies": [
-    "openimageio"
+    {
+      "name": "openimageio",
+      "features": [ "webp" ]
+    }
   ]
 }
